@@ -1,8 +1,8 @@
-# Bandz SMT
+# Bandz SMT / SSMT | Multi-Timeframe Divergence
 
 Free, open-source Pine Script v6 indicator by Bandz-ICT.
 
-Multi-timeframe SMT divergence, sweep conditions, and timecycle scanning.
+Multi-timeframe intermarket SMT divergence and sweep scanning with configurable comparison symbols.
 
 ## Install in TradingView
 
