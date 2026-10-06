@@ -1,0 +1,2255 @@
+//@version=6
+
+indicator("Bandz Multi-Timeframe SMT + Timecycle Scanner", shorttitle="Bandz SMT", overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, dynamic_requests=true)
+
+// Pine converts bar-index drawing coordinates through the `time` series internally.
+
+// v6.3 keeps the Balanced detection/supersession and broken-SMT cleanup, and removes all candle-avoidance rendering/filtering.
+// Size that buffer explicitly so realtime drawing updates do not trigger buffer errors.
+
+max_bars_back(time, 5000)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// INPUTS
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+groupSymbols = "Symbols"
+
+useComparison1    = input.bool(true, "Use Comparison Symbol 1", group=groupSymbols, tooltip="ON = chart symbol vs comparison symbol 1.")
+
+comparisonSymbol1 = input.symbol("CME_MINI:MES1!", "Comparison Symbol 1", group=groupSymbols)
+
+useComparison2    = input.bool(false, "Use Comparison Symbol 2", group=groupSymbols, tooltip="Optional second comparison symbol. If both comparison symbols trigger on the same SMT, the label merges like m5/es+ym.")
+
+comparisonSymbol2 = input.symbol("COMEX_MINI:SIL1!", "Comparison Symbol 2", group=groupSymbols)
+
+comparisonTriggerMode = input.string("Either enabled comparison", "Comparison Trigger Mode", options=["Either enabled comparison", "All enabled comparisons"], group=groupSymbols, tooltip="Either = SMT prints if chart diverges from any enabled comparison. All = SMT prints only if chart diverges from every enabled comparison with valid data.")
+
+groupFuturesData = "Futures Data"
+
+futuresDataMode = input.string("Force B-ADJ ON", "Comparison Futures Data", options=["Force B-ADJ ON", "Force B-ADJ OFF", "Inherit chart settings", "Raw symbol"], group=groupFuturesData, tooltip="Default = Force B-ADJ ON. This only changes comparison symbols used inside request.security(). Force modes still inherit chart modifiers first, then force back-adjustment on/off where TradingView supports it. Raw symbol uses the comparison symbol exactly as typed.")
+
+groupTF = "Multi-Timeframe SMT"
+
+smtFilteringMode = input.string("Clean", "SMT Filtering", options=["Clean", "Balanced", "Full"], group=groupTF, tooltip="Clean = default: legacy aggressive filtering and only untouched references. Balanced = less strict fractal swing references + exact-event duplicate cleanup + relevance-based retention. Full = minimal reference filtering and no cross-timeframe suppression. Retention limits still control clutter.")
+
+
+
+
+tfW_on   = input.bool(true,  "W",   inline="tfW",  group=groupTF)
+
+tfW      = input.timeframe("1W",   "",    inline="tfW",  group=groupTF)
+
+tfD_on   = input.bool(true,  "D",   inline="tfD",  group=groupTF)
+
+tfD      = input.timeframe("1D",   "",    inline="tfD",  group=groupTF)
+
+tf4H_on  = input.bool(true,  "4H",  inline="tf4H", group=groupTF)
+
+tf4H     = input.timeframe("240",  "",    inline="tf4H", group=groupTF)
+
+tf1H_on  = input.bool(true,  "1H",  inline="tf1H", group=groupTF)
+
+tf1H     = input.timeframe("60",   "",    inline="tf1H", group=groupTF)
+
+tf30_on  = input.bool(true,  "30m", inline="tf30", group=groupTF)
+
+tf30     = input.timeframe("30",   "",    inline="tf30", group=groupTF)
+
+tf15_on  = input.bool(true,  "15m", inline="tf15", group=groupTF)
+
+tf15     = input.timeframe("15",   "",    inline="tf15", group=groupTF)
+
+tf5_on   = input.bool(true,  "5m",  inline="tf5",  group=groupTF)
+
+tf5      = input.timeframe("5",    "",    inline="tf5",  group=groupTF)
+
+tf1_on   = input.bool(true,  "1m",  inline="tf1",  group=groupTF)
+
+tf1      = input.timeframe("1",    "",    inline="tf1",  group=groupTF)
+
+showSkippedLowerTF = input.bool(false, "Show Blocked Lower-TF Status", group=groupTF)
+
+groupLogic = "SMT Logic"
+
+showBearish       = input.bool(true, "Bearish SMT / High Sweep", inline="dir", group=groupLogic)
+
+showBullish       = input.bool(true, "Bullish SMT / Low Sweep", inline="dir", group=groupLogic)
+
+lookbackCandles   = input.int(25, "Global/Fallback Lookback Candles", minval=1, maxval=100, group=groupLogic, tooltip="Used when Per-TF Lookbacks is OFF. Also acts as a fallback.")
+
+maxPerDirection   = input.int(2, "Max SMTs Per Direction Per TF Scan", minval=1, maxval=10, group=groupLogic, tooltip="Limits how many references each timeframe may print on one scan. Lower values reduce stacked SMTs.")
+
+dedupeTicks       = input.int(2, "Deduplicate Ref Levels Within Chart Ticks", minval=0, maxval=100, group=groupLogic)
+
+requireCloseBack  = input.bool(false, "Require Close Back Inside Reference Level", group=groupLogic)
+
+persistAfterClose = input.bool(true, "Keep SMT After HTF Candle Closes", group=groupLogic)
+
+deleteBroken      = input.bool(true, "Delete Broken SMTs", group=groupLogic, tooltip="Recommended ON. Once a later bar trades beyond an SMT's stored chart-side anchor, that old SMT is removed in Clean, Balanced, and Full modes. This restores the original broken-SMT cleanup while keeping the newer detection, filtering, renderer, and supersession logic unchanged.")
+
+groupLookback = "Per-TF Lookbacks"
+
+usePerTfLookbacks = input.bool(true, "Use Per-TF Lookbacks", group=groupLookback, tooltip="ON = each SMT slot uses the matching lookback below. If you change the SMT slots to custom timeframes, turn this OFF and use the Global/Fallback Lookback.")
+
+lookbackW         = input.int(14, "W Lookback",   minval=1, maxval=100, group=groupLookback)
+
+lookbackD         = input.int(10, "D Lookback",   minval=1, maxval=100, group=groupLookback)
+
+lookback4H        = input.int(14, "4H Lookback",  minval=1, maxval=100, group=groupLookback)
+
+lookback1H        = input.int(6,  "1H Lookback",  minval=1, maxval=100, group=groupLookback)
+
+lookback30        = input.int(4,  "30m Lookback", minval=1, maxval=100, group=groupLookback)
+
+lookback15        = input.int(4,  "15m Lookback", minval=1, maxval=100, group=groupLookback)
+
+lookback5         = input.int(4,  "5m Lookback",  minval=1, maxval=100, group=groupLookback)
+
+lookback1         = input.int(6,  "1m Lookback",  minval=1, maxval=100, group=groupLookback)
+
+groupLTF = "LTF Clutter Control"
+
+enableLtfCaps       = input.bool(true, "Enable m1/m5 Clutter Caps", group=groupLTF)
+
+maxM1PerDirection   = input.int(2, "Max m1 SMTs Per Direction", minval=0, maxval=20, group=groupLTF)
+
+maxM5PerDirection   = input.int(2, "Max m2–m5 SMTs Per Direction", minval=0, maxval=20, group=groupLTF, tooltip="Applies to actual timeframes above 1m and up to 5m, including 2m/3m/5m custom slots.")
+
+maxFastLtfTotal     = input.int(6, "Max Total m1–m5 SMTs", minval=0, maxval=50, group=groupLTF, tooltip="Balanced default allows a little more fractal structure while per-TF caps still prevent runaway clutter. 0 disables the total cap.")
+
+maxLtf15Total        = input.int(8, "Max Total m1–m15 SMTs", minval=0, maxval=50, group=groupLTF, tooltip="Balanced default keeps more useful nested LTF structure without allowing unlimited accumulation. 0 disables it.")
+
+groupRetention = "SMT Retention / Cleanup"
+
+cleanupInvalidLive   = input.bool(true, "Delete Live SMT When It Stops Qualifying", group=groupRetention, tooltip="Recommended ON. A developing SMT is removed immediately if the comparison catches up, the reference loses priority, or the setup otherwise stops qualifying. Closed SMTs can still persist.")
+
+enablePerTfRetention = input.bool(true, "Limit Stored SMTs Per Timeframe", group=groupRetention, tooltip="Caps persistent drawings separately for each timeframe and direction so older SMTs cannot accumulate indefinitely.")
+
+balancedSupersession = input.bool(true, "Balanced: Supersede Stale SMTs", group=groupRetention, tooltip="Recommended ON. Detection is unchanged. After an SMT closes, Balanced mode keeps the newest closed SMT for each timeframe/direction and can preserve one genuinely larger macro parent. Developing SMTs are never used to permanently erase prior closed structure.")
+
+balancedKeepMacro = input.bool(true, "Balanced: Keep 1 Macro Parent", group=groupRetention, tooltip="Keeps one older same-timeframe/same-direction SMT only when it is substantially larger than the newest closed SMT. This preserves major structure without keeping every stale line.")
+
+balancedMacroSpanMultiple = input.float(2.5, "Balanced: Macro Minimum Span Multiple", minval=1.25, maxval=10.0, step=0.25, group=groupRetention, tooltip="An older SMT must span at least this many times the newest closed SMT's time span to survive as the single macro parent. Higher = cleaner chart. Default 2.5x.")
+
+maxKeepFastPerTfDir  = input.int(2, "Keep Per Direction Per TF: m1–m5", minval=0, maxval=20, group=groupRetention)
+
+maxKeepMidPerTfDir   = input.int(2, "Keep Per Direction Per TF: m6–m15", minval=0, maxval=20, group=groupRetention)
+
+maxKeepHourPerTfDir  = input.int(2, "Keep Per Direction Per TF: m16–1H", minval=0, maxval=20, group=groupRetention)
+
+maxKeepHtfPerTfDir   = input.int(2, "Keep Per Direction Per TF: 4H–12H", minval=0, maxval=20, group=groupRetention)
+
+maxKeepDWPerTfDir    = input.int(2, "Keep Per Direction Per TF: D/W", minval=0, maxval=8, group=groupRetention, tooltip="Balanced default = newest closed SMT + one genuinely larger macro parent per direction. Live/developing SMTs can temporarily appear in addition so they cannot erase good history before confirmation.")
+
+groupFractal = "Fractal SMT Cleanup"
+
+enableFractalCleanup = input.bool(true, "Collapse Weak Nested SMTs", group=groupFractal, tooltip="Applies across all timeframes fractally. A lower-TF SMT must pass the child rules below to remain inside a higher-TF SMT.")
+
+keepChildIfNewer     = input.bool(true, "Keep Child SMT If Newer", group=groupFractal, tooltip="A lower-TF SMT may qualify as distinct if its endpoint forms after the parent endpoint.")
+
+keepChildIfExtreme   = input.bool(true, "Keep Child SMT If More Extreme", group=groupFractal, tooltip="A lower-TF SMT may qualify as distinct if it sweeps farther than the higher-TF endpoint.")
+
+requireBothChildRules = input.bool(true, "Require Newer AND More Extreme", group=groupFractal, tooltip="Recommended ON. When both child rules are enabled, the lower-TF SMT must be both newer and more extreme. This is the main control that removes unnecessary nested LTF SMTs.")
+
+childExtremeTicks     = input.int(0, "Minimum Extra Child Sweep (Ticks)", minval=0, maxval=100, group=groupFractal, tooltip="The lower-TF endpoint must exceed the higher-TF endpoint by at least this many chart ticks before it counts as more extreme.")
+
+groupStyle = "Style"
+
+const int BANDZ_SMT_SAFE_DRAWING_CAP = 440
+
+bearColor      = input.color(color.rgb(228, 68, 72), "Bearish Line", group=groupStyle)
+
+bullColor      = input.color(color.rgb(99, 154, 242), "Bullish Line", group=groupStyle)
+
+smtOpacity     = input.int(45, "SMT Line Opacity %", minval=0, maxval=100, group=groupStyle, tooltip="100 = fully visible / max opacity. 0 = invisible.")
+
+lineStyleInput = input.string("Solid", "Line Style", options=["Solid", "Dashed", "Dotted"], group=groupStyle)
+
+lineWidth      = input.int(1, "Line Width", minval=1, maxval=5, group=groupStyle)
+
+lineXMode      = input.string("Auto Render Fix", "Line X Anchor Mode", options=["Auto Render Fix", "Bar Time", "Bar Index"], group=groupStyle, tooltip="Auto uses bar_index when the SMT is within the safe range. This helps HTF SMT lines render on zoomed-in LTF charts.")
+
+maxIndexBack   = input.int(4500, "Max Bar-Index Render Distance", minval=500, maxval=4900, group=groupStyle, tooltip="Safety-capped below Pine's 5,000-bar drawing buffer. Older SMT anchors automatically switch to Bar Time, preventing intermittent m1 historical-buffer errors.")
+
+labelTextColor = input.color(color.rgb(74, 74, 74), "Label Text", group=groupStyle)
+
+labelBgColor   = input.color(color.new(color.rgb(54, 58, 69), 100), "Label Background", group=groupStyle)
+
+verboseLabels  = input.bool(false, "Verbose Tooltips", group=groupStyle)
+
+maxDrawings    = input.int(300, "Max SMT Drawings To Keep", minval=20, maxval=BANDZ_SMT_SAFE_DRAWING_CAP, group=groupStyle, tooltip="The 440-drawing safety ceiling reserves line and label capacity so tracked SMT pairs cannot be silently garbage-collected.")
+
+groupLabelSizes = "Label Sizes By Timeframe"
+
+sizeFastTF   = input.string("Tiny", "m1–m5 Label Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=groupLabelSizes)
+
+sizeMidTF    = input.string("Tiny", "m6–m15 Label Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=groupLabelSizes)
+
+sizeNormalTF = input.string("Small", "m16–1hr Label Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=groupLabelSizes)
+
+sizeHTFTF    = input.string("Small", ">1hr Label Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=groupLabelSizes)
+
+groupAlerts = "Alerts"
+
+enableAlerts = input.bool(false, "Enable Alert Conditions", group=groupAlerts)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// HELPERS
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_lineStyle(string s) =>
+
+    switch s
+
+        "Dashed" => line.style_dashed
+
+        "Dotted" => line.style_dotted
+
+        => line.style_solid
+
+f_labelSize(string s) =>
+
+    switch s
+
+        "Tiny"   => size.tiny
+
+        "Small"  => size.small
+
+        "Normal" => size.normal
+
+        "Large"  => size.large
+
+        "Huge"   => size.huge
+
+        => size.tiny
+
+f_tfSizeString(string tf) =>
+
+    int sec = timeframe.in_seconds(tf)
+
+    string out = sizeHTFTF
+
+    if sec <= 5 * 60
+
+        out := sizeFastTF
+
+    else if sec <= 15 * 60
+
+        out := sizeMidTF
+
+    else if sec <= 60 * 60
+
+        out := sizeNormalTF
+
+    else
+
+        out := sizeHTFTF
+
+    out
+
+f_shortSymbol(string s) =>
+
+    string out = s
+
+    string[] parts = str.split(s, ":")
+
+    if array.size(parts) > 1
+
+        out := array.get(parts, array.size(parts) - 1)
+
+    out := str.replace_all(out, "1!", "")
+
+    out := str.replace_all(out, "2!", "")
+
+    out
+
+f_logoSymbol(string s) =>
+
+    string out = str.upper(f_shortSymbol(s))
+
+    if out == "MES" or out == "ES"
+
+        out := "es"
+
+    else if out == "MNQ" or out == "NQ"
+
+        out := "nq"
+
+    else if out == "MYM" or out == "YM"
+
+        out := "ym"
+
+    else if out == "M2K" or out == "RTY"
+
+        out := "rty"
+
+    else if out == "MGC" or out == "GC"
+
+        out := "gc"
+
+    else if out == "MSI" or out == "SI"
+
+        out := "si"
+
+    else if out == "MCL" or out == "CL"
+
+        out := "cl"
+
+    else
+
+        out := str.lower(out)
+
+    out
+
+f_tfLogo(string tf) =>
+
+    int sec = timeframe.in_seconds(tf)
+
+    string out = tf
+
+    if sec < 60
+
+        out := str.tostring(sec) + "s"
+
+    else if sec < 3600
+
+        out := "m" + str.tostring(int(sec / 60))
+
+    else if sec < 86400
+
+        out := str.tostring(int(sec / 3600)) + "hr"
+
+    else if sec == 86400
+
+        out := "1d"
+
+    else if sec == 604800
+
+        out := "1w"
+
+    else
+
+        out := str.lower(tf)
+
+    out
+
+f_labelLogo(string tf, string suffix) =>
+
+    f_tfLogo(tf) + "/" + suffix
+
+f_compSuffix(bool c1, bool c2) =>
+
+    string out = ""
+
+    if c1
+
+        out := f_logoSymbol(comparisonSymbol1)
+
+    if c2
+
+        out := str.length(out) > 0 ? out + "+" + f_logoSymbol(comparisonSymbol2) : f_logoSymbol(comparisonSymbol2)
+
+    out
+
+f_enabledCompSuffix() =>
+
+    string out = ""
+
+    if useComparison1
+
+        out := f_logoSymbol(comparisonSymbol1)
+
+    if useComparison2
+
+        out := str.length(out) > 0 ? out + "+" + f_logoSymbol(comparisonSymbol2) : f_logoSymbol(comparisonSymbol2)
+
+    out
+
+f_isAllowedTF(string tf) =>
+
+    timeframe.in_seconds(tf) >= timeframe.in_seconds(timeframe.period)
+
+f_levelAlreadyUsed(float[] levels, float level, float tolerance) =>
+
+    bool used = false
+
+    if array.size(levels) > 0 and tolerance > 0
+
+        for i = 0 to array.size(levels) - 1
+
+            if math.abs(array.get(levels, i) - level) <= tolerance
+
+                used := true
+
+                break
+
+    used
+
+f_endpointAlreadyUsed(int[] xs, float[] ys, int x, float y, float tolerance) =>
+
+    bool used = false
+
+    int n = math.min(array.size(xs), array.size(ys))
+
+    if n > 0
+
+        for i = 0 to n - 1
+
+            bool sameX = array.get(xs, i) == x
+
+            bool sameY = math.abs(array.get(ys, i) - y) <= tolerance
+
+            if sameX and sameY
+
+                used := true
+
+                break
+
+    used
+
+f_useIndexX(int x1Idx) =>
+
+    // Index-anchored drawings internally require `time[distance]`.
+
+    // Never allow that distance to approach/exceed the 5,000-bar buffer.
+
+    int dist = not na(x1Idx) ? bar_index - x1Idx : na
+
+    int safeIndexLimit = math.min(maxIndexBack, 4900)
+
+    bool safe = not na(dist) and dist >= 0 and dist <= safeIndexLimit
+
+    bool useIt = false
+
+    if lineXMode == "Bar Index"
+
+        useIt := safe
+
+    else if lineXMode == "Auto Render Fix"
+
+        useIt := safe
+
+    else
+
+        useIt := false
+
+    useIt
+
+f_getComparisonTicker(string sym) =>
+
+    string inherited = ticker.inherit(syminfo.tickerid, sym)
+
+    string out = sym
+
+    if futuresDataMode == "Force B-ADJ ON"
+
+        out := ticker.modify(inherited, backadjustment=backadjustment.on)
+
+    else if futuresDataMode == "Force B-ADJ OFF"
+
+        out := ticker.modify(inherited, backadjustment=backadjustment.off)
+
+    else if futuresDataMode == "Inherit chart settings"
+
+        out := inherited
+
+    else
+
+        out := sym
+
+    out
+
+// Balanced reference eligibility works fractally on every timeframe.
+// Clean mode keeps the old "untouched level only" rule. Balanced also allows
+// completed local swing highs/lows, so a meaningful nested swing is not erased
+// merely because a later swing formed outside it. Full allows every scanned ref.
+f_localSwingHigh(int refIdx, float refH, float[] highs, float tolerance) =>
+
+    int n = array.size(highs)
+    bool swing = false
+
+    if refIdx == 0
+        swing := true
+    else if refIdx < n
+        float newerH = array.get(highs, refIdx - 1)
+        bool newerSide = na(newerH) or refH >= newerH - tolerance
+        bool olderSide = true
+        if refIdx + 1 < n
+            float olderH = array.get(highs, refIdx + 1)
+            olderSide := na(olderH) or refH >= olderH - tolerance
+        swing := newerSide and olderSide
+
+    swing
+
+f_localSwingLow(int refIdx, float refL, float[] lows, float tolerance) =>
+
+    int n = array.size(lows)
+    bool swing = false
+
+    if refIdx == 0
+        swing := true
+    else if refIdx < n
+        float newerL = array.get(lows, refIdx - 1)
+        bool newerSide = na(newerL) or refL <= newerL + tolerance
+        bool olderSide = true
+        if refIdx + 1 < n
+            float olderL = array.get(lows, refIdx + 1)
+            olderSide := na(olderL) or refL <= olderL + tolerance
+        swing := newerSide and olderSide
+
+    swing
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// DRAWING STATE
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+type SMTDraw
+
+    string key
+
+    string tf
+
+    int    tfSec
+
+    int    dir
+
+    int    refStart
+
+    int    curStart
+
+    int    lastSeenBar
+
+    float  anchor
+
+    int    x1Time
+
+    int    x2Time
+
+    int    x1Idx
+
+    int    x2Idx
+
+    float  y1
+
+    float  y2
+
+    bool   useIndexX
+
+    line   ln
+
+
+    label  lb
+
+var SMTDraw[] smtEvents = array.new<SMTDraw>(0)
+
+f_findEvent(string key) =>
+
+    int idx = -1
+
+    if array.size(smtEvents) > 0
+
+        for i = 0 to array.size(smtEvents) - 1
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.key == key
+
+                idx := i
+
+                break
+
+    idx
+
+f_deleteEventAt(int idx) =>
+
+    if idx >= 0 and idx < array.size(smtEvents)
+
+        SMTDraw ev = array.get(smtEvents, idx)
+
+        if not na(ev.ln)
+
+            line.delete(ev.ln)
+
+
+        if not na(ev.lb)
+
+            label.delete(ev.lb)
+
+        array.remove(smtEvents, idx)
+
+f_deleteEventByKey(string key) =>
+
+    int idx = f_findEvent(key)
+
+    if idx != -1
+
+        f_deleteEventAt(idx)
+
+f_deleteEventsByTFStart(string tf, int curStart) =>
+
+    if array.size(smtEvents) > 0
+
+        for i = array.size(smtEvents) - 1 to 0
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tf == tf and ev.curStart == curStart
+
+                f_deleteEventAt(i)
+
+f_deleteAllEventsByTF(string tf) =>
+
+    if array.size(smtEvents) > 0
+
+        for i = array.size(smtEvents) - 1 to 0
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tf == tf
+
+                f_deleteEventAt(i)
+
+f_deleteSameEndpointEvents(string tf, int curStart, int dir, int x2Time, float y2, float tolerance, string keepKey) =>
+
+    if array.size(smtEvents) > 0
+
+        for i = array.size(smtEvents) - 1 to 0
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tf == tf and ev.curStart == curStart and ev.dir == dir and ev.key != keepKey
+
+                bool sameEndpoint = ev.x2Time == x2Time and math.abs(ev.y2 - y2) <= tolerance
+
+                if sameEndpoint
+
+                    f_deleteEventAt(i)
+
+f_deleteSameReferenceEvents(string tf, int dir, int x1Time, float y1, float tolerance, string keepKey) =>
+
+    // Daily and Weekly SMTs are "must-show" HTF events. Do not let a newer
+    // D/W SMT erase an older valid D/W SMT just because they share a reference.
+    bool protectDailyWeekly = timeframe.in_seconds(tf) >= 24 * 60 * 60
+
+    if not protectDailyWeekly and array.size(smtEvents) > 0
+
+        for i = array.size(smtEvents) - 1 to 0
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tf == tf and ev.dir == dir and ev.key != keepKey
+
+                bool sameReference = ev.x1Time == x1Time and math.abs(ev.y1 - y1) <= tolerance
+
+                if sameReference
+
+                    f_deleteEventAt(i)
+
+f_childMoreExtreme(int dir, float childY2, float parentY2) =>
+
+    float buf = childExtremeTicks * syminfo.mintick
+
+    bool more = false
+
+    if dir == -1
+
+        more := childY2 > parentY2 + buf
+
+    else
+
+        more := childY2 < parentY2 - buf
+
+    more
+
+f_childUsefulAgainstParent(int dir, int childX2Time, float childY2, int parentX2Time, float parentY2) =>
+
+    bool rawNewer = childX2Time > parentX2Time
+
+    bool rawExtreme = f_childMoreExtreme(dir, childY2, parentY2)
+
+    bool newerPass = not keepChildIfNewer or rawNewer
+
+    bool extremePass = not keepChildIfExtreme or rawExtreme
+
+    bool anyRuleEnabled = keepChildIfNewer or keepChildIfExtreme
+
+    bool eitherPass = (keepChildIfNewer and rawNewer) or (keepChildIfExtreme and rawExtreme)
+
+    bool bothPass = newerPass and extremePass
+
+    anyRuleEnabled and (requireBothChildRules ? bothPass : eitherPass)
+
+f_childInsideParent(SMTDraw parent, int childX1Time, int childX2Time) =>
+
+    int parentRefEnd = parent.refStart + parent.tfSec * 1000
+
+    int parentCurEnd = parent.curStart + parent.tfSec * 1000
+
+    bool refInside = childX1Time >= parent.refStart and childX1Time < parentRefEnd
+
+    bool curInside = childX2Time >= parent.curStart and childX2Time < parentCurEnd
+
+    refInside and curInside
+
+f_childInsideHigherWindow(int higherTfSec, int higherRefStart, int higherCurStart, int childX1Time, int childX2Time) =>
+
+    int higherRefEnd = higherRefStart + higherTfSec * 1000
+
+    int higherCurEnd = higherCurStart + higherTfSec * 1000
+
+    bool refInside = childX1Time >= higherRefStart and childX1Time < higherRefEnd
+
+    bool curInside = childX2Time >= higherCurStart and childX2Time < higherCurEnd
+
+    refInside and curInside
+
+f_isSuppressedByHigherTF(int dir, int tfSec, int x1Time, float y1, int x2Time, float y2, float tolerance) =>
+
+    bool suppressed = false
+
+    if array.size(smtEvents) > 0
+
+        if smtFilteringMode == "Balanced"
+
+            // BALANCED MODE:
+            // SMT structure is fractal. Being inside a larger SMT, sharing only
+            // the reference, or sharing only the endpoint does NOT invalidate it.
+            // Collapse only a true duplicate represented on a higher timeframe:
+            // same reference extreme AND same sweep extreme.
+            for i = 0 to array.size(smtEvents) - 1
+
+                SMTDraw ev = array.get(smtEvents, i)
+
+                if ev.dir == dir and ev.tfSec > tfSec
+
+                    bool sameEndpoint = ev.x2Time == x2Time and math.abs(ev.y2 - y2) <= tolerance
+
+                    bool sameReference = ev.x1Time == x1Time and math.abs(ev.y1 - y1) <= tolerance
+
+                    if sameEndpoint and sameReference
+
+                        suppressed := true
+
+                        break
+
+        else if smtFilteringMode == "Clean"
+
+            // CLEAN MODE:
+            // Original aggressive Highest-TF-Wins behavior. A higher timeframe
+            // may suppress shared endpoints, weak shared references, and weak
+            // nested child structures.
+            for i = 0 to array.size(smtEvents) - 1
+
+                SMTDraw ev = array.get(smtEvents, i)
+
+                if ev.dir == dir and ev.tfSec > tfSec
+
+                    bool sameEndpoint = ev.x2Time == x2Time and math.abs(ev.y2 - y2) <= tolerance
+
+                    bool sameReference = ev.x1Time == x1Time and math.abs(ev.y1 - y1) <= tolerance
+
+                    bool useful = f_childUsefulAgainstParent(dir, x2Time, y2, ev.x2Time, ev.y2)
+
+                    bool endpointDuplicate = sameEndpoint
+
+                    bool referenceDuplicate = sameReference and not useful
+
+                    bool nestedDuplicate = false
+
+                    if enableFractalCleanup and tfSec <= 60 * 60
+
+                        bool nested = f_childInsideParent(ev, x1Time, x2Time)
+
+                        nestedDuplicate := nested and not useful
+
+                    if endpointDuplicate or referenceDuplicate or nestedDuplicate
+
+                        suppressed := true
+
+                        break
+
+        // FULL MODE intentionally performs no cross-timeframe suppression.
+
+    suppressed
+
+f_deleteLowerTFEventsCoveredByHigher(int tfSec, int dir, int refStart, int curStart, int x1Time, float y1, int x2Time, float y2, float tolerance, string keepKey) =>
+
+    if array.size(smtEvents) > 0
+
+        if smtFilteringMode == "Balanced"
+
+            // When a higher-TF event appears later, remove a lower-TF event only
+            // when both anchors prove they are the same exact geometric SMT.
+            for i = array.size(smtEvents) - 1 to 0
+
+                SMTDraw ev = array.get(smtEvents, i)
+
+                if ev.key != keepKey and ev.dir == dir and ev.tfSec < tfSec
+
+                    bool sameEndpoint = ev.x2Time == x2Time and math.abs(ev.y2 - y2) <= tolerance
+
+                    bool sameReference = ev.x1Time == x1Time and math.abs(ev.y1 - y1) <= tolerance
+
+                    if sameEndpoint and sameReference
+
+                        f_deleteEventAt(i)
+
+        else if smtFilteringMode == "Clean"
+
+            // Original aggressive cleanup behavior.
+            for i = array.size(smtEvents) - 1 to 0
+
+                SMTDraw ev = array.get(smtEvents, i)
+
+                if ev.key != keepKey and ev.dir == dir and ev.tfSec < tfSec
+
+                    bool sameEndpoint = ev.x2Time == x2Time and math.abs(ev.y2 - y2) <= tolerance
+
+                    bool sameReference = ev.x1Time == x1Time and math.abs(ev.y1 - y1) <= tolerance
+
+                    bool useful = f_childUsefulAgainstParent(dir, ev.x2Time, ev.y2, x2Time, y2)
+
+                    bool endpointDuplicate = sameEndpoint
+
+                    bool referenceDuplicate = sameReference and not useful
+
+                    bool nestedDuplicate = false
+
+                    if enableFractalCleanup and ev.tfSec <= 60 * 60
+
+                        bool nested = f_childInsideHigherWindow(tfSec, refStart, curStart, ev.x1Time, ev.x2Time)
+
+                        nestedDuplicate := nested and not useful
+
+                    if endpointDuplicate or referenceDuplicate or nestedDuplicate
+
+                        f_deleteEventAt(i)
+
+        // FULL MODE intentionally keeps all cross-timeframe events.
+
+f_prepareDrawingPair() =>
+
+    while array.size(smtEvents) >= maxDrawings
+
+        f_deleteEventAt(array.size(smtEvents) - 1)
+
+f_countBucket(int minSecExclusive, int maxSec, int dir) =>
+
+    int count = 0
+
+    if array.size(smtEvents) > 0
+
+        for i = 0 to array.size(smtEvents) - 1
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tfSec > minSecExclusive and ev.tfSec <= maxSec and ev.dir == dir
+
+                count += 1
+
+    count
+
+f_deleteOldestBucket(int minSecExclusive, int maxSec, int dir) =>
+
+    int oldestIdx = -1
+
+    int oldestTime = na
+
+    if array.size(smtEvents) > 0
+
+        for i = 0 to array.size(smtEvents) - 1
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tfSec > minSecExclusive and ev.tfSec <= maxSec and ev.dir == dir
+
+                if oldestIdx == -1 or ev.x2Time < oldestTime
+
+                    oldestIdx := i
+
+                    oldestTime := ev.x2Time
+
+    if oldestIdx != -1
+
+        f_deleteEventAt(oldestIdx)
+
+f_enforceBucketCap(int minSecExclusive, int maxSec, int dir, int cap) =>
+
+    int guard = 0
+
+    while f_countBucket(minSecExclusive, maxSec, dir) > cap and guard < 100
+
+        f_deleteOldestBucket(minSecExclusive, maxSec, dir)
+
+        guard += 1
+
+f_countFastLtfTotal() =>
+
+    int count = 0
+
+    if array.size(smtEvents) > 0
+
+        for i = 0 to array.size(smtEvents) - 1
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tfSec <= 5 * 60
+
+                count += 1
+
+    count
+
+f_deleteOldestFastLtf() =>
+
+    int oldestIdx = -1
+
+    int oldestTime = na
+
+    if array.size(smtEvents) > 0
+
+        for i = 0 to array.size(smtEvents) - 1
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tfSec <= 5 * 60
+
+                if oldestIdx == -1 or ev.x2Time < oldestTime
+
+                    oldestIdx := i
+
+                    oldestTime := ev.x2Time
+
+    if oldestIdx != -1
+
+        f_deleteEventAt(oldestIdx)
+
+f_countLtfThrough(int maxSec) =>
+
+    int count = 0
+
+    if array.size(smtEvents) > 0
+
+        for i = 0 to array.size(smtEvents) - 1
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tfSec <= maxSec
+
+                count += 1
+
+    count
+
+f_deleteOldestLtfThrough(int maxSec) =>
+
+    int oldestIdx = -1
+
+    int oldestTime = na
+
+    if array.size(smtEvents) > 0
+
+        for i = 0 to array.size(smtEvents) - 1
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tfSec <= maxSec
+
+                if oldestIdx == -1 or ev.x2Time < oldestTime
+
+                    oldestIdx := i
+
+                    oldestTime := ev.x2Time
+
+    if oldestIdx != -1
+
+        f_deleteEventAt(oldestIdx)
+
+f_countExactTFDirection(string tf, int dir) =>
+
+    int count = 0
+
+    if array.size(smtEvents) > 0
+
+        for i = 0 to array.size(smtEvents) - 1
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tf == tf and ev.dir == dir
+
+                count += 1
+
+    count
+
+f_deleteOldestExactTFDirection(string tf, int dir) =>
+
+    int oldestIdx = -1
+
+    int oldestTime = na
+
+    if array.size(smtEvents) > 0
+
+        for i = 0 to array.size(smtEvents) - 1
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tf == tf and ev.dir == dir
+
+                if oldestIdx == -1 or ev.x2Time < oldestTime
+
+                    oldestIdx := i
+
+                    oldestTime := ev.x2Time
+
+    if oldestIdx != -1
+
+        f_deleteEventAt(oldestIdx)
+
+f_widestExactTFDirectionKey(string tf, int dir) =>
+
+    string bestKey = ""
+    int bestSpan = -1
+    int bestEnd = na
+
+    if array.size(smtEvents) > 0
+
+        for i = 0 to array.size(smtEvents) - 1
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tf == tf and ev.dir == dir
+
+                int span = math.max(0, ev.x2Time - ev.x1Time)
+
+                if str.length(bestKey) == 0 or span > bestSpan or (span == bestSpan and (na(bestEnd) or ev.x2Time > bestEnd))
+
+                    bestKey := ev.key
+                    bestSpan := span
+                    bestEnd := ev.x2Time
+
+    bestKey
+
+f_deleteOldestExactTFDirectionExcept(string tf, int dir, string protectKey) =>
+
+    int oldestIdx = -1
+    int oldestEnd = na
+    int oldestRef = na
+
+    if array.size(smtEvents) > 0
+
+        for i = 0 to array.size(smtEvents) - 1
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tf == tf and ev.dir == dir and ev.key != protectKey
+
+                bool olderEnd = oldestIdx == -1 or ev.x2Time < oldestEnd
+                bool sameEndOlderRef = oldestIdx != -1 and ev.x2Time == oldestEnd and ev.x1Time < oldestRef
+
+                if olderEnd or sameEndOlderRef
+
+                    oldestIdx := i
+                    oldestEnd := ev.x2Time
+                    oldestRef := ev.x1Time
+
+    if oldestIdx != -1
+
+        f_deleteEventAt(oldestIdx)
+
+// Balanced v6 retention is intentionally separate from SMT detection.
+// A developing event is never allowed to permanently supersede closed history,
+// because it may stop qualifying before its timeframe candle closes.
+f_newestClosedExactTFDirectionKey(string tf, int dir) =>
+
+    string bestKey = ""
+    int bestEnd = na
+    int bestRef = na
+
+    if array.size(smtEvents) > 0
+
+        for i = 0 to array.size(smtEvents) - 1
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            bool closedEvent = ev.lastSeenBar != bar_index
+
+            if ev.tf == tf and ev.dir == dir and closedEvent
+
+                bool newerEnd = str.length(bestKey) == 0 or ev.x2Time > bestEnd
+                bool sameEndNewerRef = str.length(bestKey) > 0 and ev.x2Time == bestEnd and ev.x1Time > bestRef
+
+                if newerEnd or sameEndNewerRef
+
+                    bestKey := ev.key
+                    bestEnd := ev.x2Time
+                    bestRef := ev.x1Time
+
+    bestKey
+
+f_macroClosedExactTFDirectionKey(string tf, int dir, string newestKey) =>
+
+    string bestKey = ""
+    int bestSpan = -1
+    int bestEnd = na
+
+    int newestIdx = f_findEvent(newestKey)
+
+    if newestIdx != -1 and balancedKeepMacro
+
+        SMTDraw newest = array.get(smtEvents, newestIdx)
+        int newestSpan = math.max(newest.tfSec * 1000, math.max(0, newest.x2Time - newest.x1Time))
+        float requiredSpan = newestSpan * balancedMacroSpanMultiple
+
+        if array.size(smtEvents) > 0
+
+            for i = 0 to array.size(smtEvents) - 1
+
+                SMTDraw ev = array.get(smtEvents, i)
+                bool closedEvent = ev.lastSeenBar != bar_index
+
+                if ev.tf == tf and ev.dir == dir and ev.key != newestKey and closedEvent
+
+                    int span = math.max(0, ev.x2Time - ev.x1Time)
+
+                    // A macro survivor must be a true older parent, not simply a
+                    // neighboring old line. The span test is the main clutter gate.
+                    bool olderParent = ev.x1Time < newest.x1Time
+                    bool largeEnough = span >= requiredSpan
+
+                    if olderParent and largeEnough
+
+                        if str.length(bestKey) == 0 or span > bestSpan or (span == bestSpan and (na(bestEnd) or ev.x2Time > bestEnd))
+
+                            bestKey := ev.key
+                            bestSpan := span
+                            bestEnd := ev.x2Time
+
+    bestKey
+
+f_deleteClosedExactTFDirectionExcept(string tf, int dir, string keepNewestKey, string keepMacroKey) =>
+
+    bool changed = false
+
+    if array.size(smtEvents) > 0
+
+        for i = array.size(smtEvents) - 1 to 0
+
+            SMTDraw ev = array.get(smtEvents, i)
+            bool closedEvent = ev.lastSeenBar != bar_index
+            bool protected = ev.key == keepNewestKey or (str.length(keepMacroKey) > 0 and ev.key == keepMacroKey)
+
+            if ev.tf == tf and ev.dir == dir and closedEvent and not protected
+
+                f_deleteEventAt(i)
+                changed := true
+
+    changed
+
+f_deleteAllExactTFDirection(string tf, int dir) =>
+
+    bool changed = false
+
+    if array.size(smtEvents) > 0
+
+        for i = array.size(smtEvents) - 1 to 0
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tf == tf and ev.dir == dir
+
+                f_deleteEventAt(i)
+                changed := true
+
+    changed
+
+f_applyBalancedSupersession(string tf, int dir, int cap) =>
+
+    bool changed = false
+
+    if cap <= 0
+
+        changed := f_deleteAllExactTFDirection(tf, dir)
+
+    else
+
+        string newestKey = f_newestClosedExactTFDirectionKey(tf, dir)
+        string macroKey = ""
+
+        if cap >= 2 and str.length(newestKey) > 0
+
+            macroKey := f_macroClosedExactTFDirectionKey(tf, dir, newestKey)
+
+        // Keep all currently developing events. Only CLOSED history is superseded.
+        // That way a live SMT can disappear without having destroyed the previous
+        // useful closed SMT. Once it closes, the next bar promotes it to newest.
+        changed := f_deleteClosedExactTFDirectionExcept(tf, dir, newestKey, macroKey)
+
+    changed
+
+f_retentionCapForSec(int tfSec) =>
+
+    int cap = maxKeepHtfPerTfDir
+
+    if tfSec <= 5 * 60
+
+        cap := maxKeepFastPerTfDir
+
+    else if tfSec <= 15 * 60
+
+        cap := maxKeepMidPerTfDir
+
+    else if tfSec <= 60 * 60
+
+        cap := maxKeepHourPerTfDir
+
+    else if tfSec >= 24 * 60 * 60
+
+        cap := maxKeepDWPerTfDir
+
+    else
+
+        cap := maxKeepHtfPerTfDir
+
+    cap
+
+f_enforceExactTFRetention(string tf) =>
+
+    bool changed = false
+
+    if enablePerTfRetention
+
+        int tfSec = timeframe.in_seconds(tf)
+        int cap = f_retentionCapForSec(tfSec)
+
+        if smtFilteringMode == "Balanced" and balancedSupersession
+
+            // Fractal supersession: same rule on every timeframe. Newer structure
+            // replaces stale same-TF/same-direction history, while one truly larger
+            // macro parent can survive. No cross-timeframe SMT is deleted here.
+            bool bearChanged = f_applyBalancedSupersession(tf, -1, cap)
+            bool bullChanged = f_applyBalancedSupersession(tf, 1, cap)
+            changed := bearChanged or bullChanged
+
+        else
+
+            // Clean/Full, or Balanced with supersession disabled, retain the v5
+            // hard-cap behavior for easy A/B testing.
+            bool keepMacroPlusRecent = smtFilteringMode == "Balanced" and tfSec >= 60 * 60 and cap >= 2
+
+            int guardBear = 0
+
+            while f_countExactTFDirection(tf, -1) > cap and guardBear < 100
+
+                if keepMacroPlusRecent
+                    string macroBearKey = f_widestExactTFDirectionKey(tf, -1)
+                    f_deleteOldestExactTFDirectionExcept(tf, -1, macroBearKey)
+                else
+                    f_deleteOldestExactTFDirection(tf, -1)
+
+                guardBear += 1
+                changed := true
+
+            int guardBull = 0
+
+            while f_countExactTFDirection(tf, 1) > cap and guardBull < 100
+
+                if keepMacroPlusRecent
+                    string macroBullKey = f_widestExactTFDirectionKey(tf, 1)
+                    f_deleteOldestExactTFDirectionExcept(tf, 1, macroBullKey)
+                else
+                    f_deleteOldestExactTFDirection(tf, 1)
+
+                guardBull += 1
+                changed := true
+
+    changed
+
+f_enforceLtfCaps() =>
+
+    if enableLtfCaps
+
+        f_enforceBucketCap(0, 60, -1, maxM1PerDirection)
+
+        f_enforceBucketCap(0, 60, 1, maxM1PerDirection)
+
+        f_enforceBucketCap(60, 5 * 60, -1, maxM5PerDirection)
+
+        f_enforceBucketCap(60, 5 * 60, 1, maxM5PerDirection)
+
+        if maxFastLtfTotal > 0
+
+            int guardFast = 0
+
+            while f_countFastLtfTotal() > maxFastLtfTotal and guardFast < 100
+
+                f_deleteOldestFastLtf()
+
+                guardFast += 1
+
+        if maxLtf15Total > 0
+
+            int guard15 = 0
+
+            while f_countLtfThrough(15 * 60) > maxLtf15Total and guard15 < 100
+
+                f_deleteOldestLtfThrough(15 * 60)
+
+                guard15 += 1
+
+f_makeLine(bool useIndexX, int x1Time, int x1Idx, float y1, int x2Time, int x2Idx, float y2, color lnColor) =>
+
+    line ln = na
+
+    if useIndexX
+
+        ln := line.new(x1Idx, y1, x2Idx, y2, xloc=xloc.bar_index, color=lnColor, width=lineWidth, style=f_lineStyle(lineStyleInput))
+
+    else
+
+        ln := line.new(x1Time, y1, x2Time, y2, xloc=xloc.bar_time, color=lnColor, width=lineWidth, style=f_lineStyle(lineStyleInput))
+
+    ln
+
+f_makeLabel(bool useIndexX, int x1Time, int x1Idx, float y1, int x2Time, int x2Idx, float y2, int dir, string txt, string tip, string labelSizeStr) =>
+
+    int labelX = useIndexX ? int(math.round((x1Idx + x2Idx) / 2.0)) : int(math.round((x1Time + x2Time) / 2.0))
+
+    float midY = (y1 + y2) / 2.0
+
+    float off = math.max(syminfo.mintick * 10.0, math.abs(y2 - y1) * 0.35)
+
+    float labelY = dir == -1 ? midY + off : midY - off
+
+    label_style = dir == -1 ? label.style_label_down : label.style_label_up
+
+    label lb = na
+
+    if useIndexX
+
+        lb := label.new(labelX, labelY, txt, xloc=xloc.bar_index, color=labelBgColor, textcolor=labelTextColor, style=label_style, size=f_labelSize(labelSizeStr), text_font_family=font.family_monospace)
+
+    else
+
+        lb := label.new(labelX, labelY, txt, xloc=xloc.bar_time, color=labelBgColor, textcolor=labelTextColor, style=label_style, size=f_labelSize(labelSizeStr), text_font_family=font.family_monospace)
+
+    label.set_tooltip(lb, tip)
+
+    lb
+
+f_updateLabel(label lb, bool useIndexX, int x1Time, int x1Idx, float y1, int x2Time, int x2Idx, float y2, int dir, string txt, string tip, string labelSizeStr) =>
+
+    int labelX = useIndexX ? int(math.round((x1Idx + x2Idx) / 2.0)) : int(math.round((x1Time + x2Time) / 2.0))
+
+    float midY = (y1 + y2) / 2.0
+
+    float off = math.max(syminfo.mintick * 10.0, math.abs(y2 - y1) * 0.35)
+
+    float labelY = dir == -1 ? midY + off : midY - off
+
+    label_style = dir == -1 ? label.style_label_down : label.style_label_up
+
+    label.set_xy(lb, labelX, labelY)
+
+    label.set_text(lb, txt)
+
+    label.set_textcolor(lb, labelTextColor)
+
+    label.set_color(lb, labelBgColor)
+
+    label.set_style(lb, label_style)
+
+    label.set_size(lb, f_labelSize(labelSizeStr))
+
+    label.set_tooltip(lb, tip)
+
+f_drawOrUpdate(string key, string tf, int tfSec, int dir, int refStart, int curStart, int x1Time, int x1Idx, float y1, int x2Time, int x2Idx, float y2, float anchor, string txt, string tip, float endpointTol, string labelSizeStr) =>
+
+    bool drawn = false
+
+    if f_isSuppressedByHigherTF(dir, tfSec, x1Time, y1, x2Time, y2, endpointTol)
+
+        f_deleteEventByKey(key)
+
+        drawn := false
+
+    else
+
+        // In Balanced/Full mode, same-TF SMTs with the same endpoint but a
+        // different historical reference are distinct structures and may coexist.
+        // Clean mode keeps the original aggressive same-TF replacement behavior.
+        if smtFilteringMode == "Clean"
+
+            f_deleteSameEndpointEvents(tf, curStart, dir, x2Time, y2, endpointTol, key)
+
+            f_deleteSameReferenceEvents(tf, dir, x1Time, y1, endpointTol, key)
+
+        int transp = 100 - smtOpacity
+
+        color lnColor = dir == -1 ? color.new(bearColor, transp) : color.new(bullColor, transp)
+
+        bool useIndexX = f_useIndexX(x1Idx)
+
+        int idx = f_findEvent(key)
+
+        if idx == -1
+
+            f_prepareDrawingPair()
+
+            line ln = f_makeLine(useIndexX, x1Time, x1Idx, y1, x2Time, x2Idx, y2, lnColor)
+
+            label lb = f_makeLabel(useIndexX, x1Time, x1Idx, y1, x2Time, x2Idx, y2, dir, txt, tip, labelSizeStr)
+
+            SMTDraw ev = SMTDraw.new()
+
+            ev.key := key
+
+            ev.tf := tf
+
+            ev.tfSec := tfSec
+
+            ev.dir := dir
+
+            ev.refStart := refStart
+
+            ev.curStart := curStart
+
+            ev.lastSeenBar := bar_index
+
+            ev.anchor := anchor
+
+            ev.x1Time := x1Time
+
+            ev.x2Time := x2Time
+
+            ev.x1Idx := x1Idx
+
+            ev.x2Idx := x2Idx
+
+            ev.y1 := y1
+
+            ev.y2 := y2
+
+            ev.useIndexX := useIndexX
+
+            ev.ln := ln
+
+            ev.lb := lb
+
+            array.unshift(smtEvents, ev)
+
+        else
+
+            SMTDraw ev = array.get(smtEvents, idx)
+
+            bool recreate = ev.useIndexX != useIndexX or na(ev.ln) or na(ev.lb)
+
+            if recreate
+
+                if not na(ev.ln)
+
+                    line.delete(ev.ln)
+
+                if not na(ev.lb)
+
+                    label.delete(ev.lb)
+
+                ev.ln := f_makeLine(useIndexX, x1Time, x1Idx, y1, x2Time, x2Idx, y2, lnColor)
+
+                ev.lb := f_makeLabel(useIndexX, x1Time, x1Idx, y1, x2Time, x2Idx, y2, dir, txt, tip, labelSizeStr)
+
+                ev.useIndexX := useIndexX
+
+            else
+
+                line.set_xy1(ev.ln, useIndexX ? x1Idx : x1Time, y1)
+
+                line.set_xy2(ev.ln, useIndexX ? x2Idx : x2Time, y2)
+
+                line.set_color(ev.ln, lnColor)
+
+                line.set_width(ev.ln, lineWidth)
+
+                line.set_style(ev.ln, f_lineStyle(lineStyleInput))
+
+                f_updateLabel(ev.lb, useIndexX, x1Time, x1Idx, y1, x2Time, x2Idx, y2, dir, txt, tip, labelSizeStr)
+
+            ev.lastSeenBar := bar_index
+
+            ev.anchor := anchor
+
+            ev.refStart := refStart
+
+            ev.curStart := curStart
+
+            ev.x1Time := x1Time
+
+            ev.x2Time := x2Time
+
+            ev.x1Idx := x1Idx
+
+            ev.x2Idx := x2Idx
+
+            ev.y1 := y1
+
+            ev.y2 := y2
+
+            array.set(smtEvents, idx, ev)
+
+        f_deleteLowerTFEventsCoveredByHigher(tfSec, dir, refStart, curStart, x1Time, y1, x2Time, y2, endpointTol, key)
+
+        drawn := true
+
+    drawn
+
+f_deleteUnseenCurrentTF(string tf, int curStart) =>
+
+    // This is separate from persistAfterClose. Persistence applies only after the
+
+    // timeframe candle closes. A live/developing SMT should not remain visible
+
+    // after it stops qualifying during the current timeframe candle.
+
+    if cleanupInvalidLive and array.size(smtEvents) > 0
+
+        for i = array.size(smtEvents) - 1 to 0
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            if ev.tf == tf and ev.curStart == curStart and ev.lastSeenBar != bar_index
+
+                f_deleteEventAt(i)
+
+f_purgeBroken() =>
+
+    // Restore the original broken-SMT behavior in every filtering mode.
+    // The event must first have stopped updating on the current chart bar.
+    // After that:
+    //   bearish SMT -> a later chart high above its stored anchor supersedes/breaks it
+    //   bullish SMT -> a later chart low below its stored anchor supersedes/breaks it
+    // This is independent of overlap filtering and retention, so stale lines do not
+    // survive merely because Balanced mode considers them useful historical structure.
+    if deleteBroken and array.size(smtEvents) > 0
+
+        for i = array.size(smtEvents) - 1 to 0
+
+            SMTDraw ev = array.get(smtEvents, i)
+
+            bool laterBar = bar_index > ev.lastSeenBar
+            bool brokeHigh = ev.dir == -1 and high > ev.anchor
+            bool brokeLow = ev.dir == 1 and low < ev.anchor
+            bool broken = laterBar and (brokeHigh or brokeLow)
+
+            if broken
+
+                f_deleteEventAt(i)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// COMPARISON DATA ON CURRENT CHART TF
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+comparisonTicker1 = f_getComparisonTicker(comparisonSymbol1)
+
+comparisonTicker2 = f_getComparisonTicker(comparisonSymbol2)
+
+[cmp1TimeChart, cmp1CloseTimeChart, cmp1HighRaw, cmp1LowRaw] = request.security(comparisonTicker1, timeframe.period, [time, time_close, high, low], gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+
+[cmp2TimeChart, cmp2CloseTimeChart, cmp2HighRaw, cmp2LowRaw] = request.security(comparisonTicker2, timeframe.period, [time, time_close, high, low], gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+
+bool cmp1IntervalAligned = not na(cmp1TimeChart) and not na(cmp1CloseTimeChart) and cmp1TimeChart == time and cmp1CloseTimeChart == time_close
+
+bool cmp2IntervalAligned = not na(cmp2TimeChart) and not na(cmp2CloseTimeChart) and cmp2TimeChart == time and cmp2CloseTimeChart == time_close
+
+float cmp1HighChart = useComparison1 and cmp1IntervalAligned and not na(cmp1HighRaw) and not na(cmp1LowRaw) ? cmp1HighRaw : na
+
+float cmp1LowChart = useComparison1 and cmp1IntervalAligned and not na(cmp1HighRaw) and not na(cmp1LowRaw) ? cmp1LowRaw : na
+
+float cmp2HighChart = useComparison2 and cmp2IntervalAligned and not na(cmp2HighRaw) and not na(cmp2LowRaw) ? cmp2HighRaw : na
+
+float cmp2LowChart = useComparison2 and cmp2IntervalAligned and not na(cmp2HighRaw) and not na(cmp2LowRaw) ? cmp2LowRaw : na
+
+// Native previous Daily/Weekly reference candles.
+// Only the immediately previous closed D/W candle uses these values.
+// [1] + lookahead_on is safe here because the requested candle is already closed.
+[chartDPrevH, chartDPrevL] = request.security(syminfo.tickerid, tfD, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+[chartWPrevH, chartWPrevL] = request.security(syminfo.tickerid, tfW, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+[cmp1DPrevHRaw, cmp1DPrevLRaw] = request.security(comparisonTicker1, tfD, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp1WPrevHRaw, cmp1WPrevLRaw] = request.security(comparisonTicker1, tfW, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp2DPrevHRaw, cmp2DPrevLRaw] = request.security(comparisonTicker2, tfD, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp2WPrevHRaw, cmp2WPrevLRaw] = request.security(comparisonTicker2, tfW, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+
+// Native previous comparison candles for every configured timeframe.
+// These are scalar tuples (memory-safe) and repair the most important adjacent
+// reference on lower timeframes too, rather than only repairing D/W.
+[cmp1_4HPrevHRaw, cmp1_4HPrevLRaw] = request.security(comparisonTicker1, tf4H, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp1_1HPrevHRaw, cmp1_1HPrevLRaw] = request.security(comparisonTicker1, tf1H, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp1_30PrevHRaw, cmp1_30PrevLRaw] = request.security(comparisonTicker1, tf30, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp1_15PrevHRaw, cmp1_15PrevLRaw] = request.security(comparisonTicker1, tf15, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp1_5PrevHRaw, cmp1_5PrevLRaw] = request.security(comparisonTicker1, tf5, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp1_1PrevHRaw, cmp1_1PrevLRaw] = request.security(comparisonTicker1, tf1, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+
+[cmp2_4HPrevHRaw, cmp2_4HPrevLRaw] = request.security(comparisonTicker2, tf4H, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp2_1HPrevHRaw, cmp2_1HPrevLRaw] = request.security(comparisonTicker2, tf1H, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp2_30PrevHRaw, cmp2_30PrevLRaw] = request.security(comparisonTicker2, tf30, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp2_15PrevHRaw, cmp2_15PrevLRaw] = request.security(comparisonTicker2, tf15, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp2_5PrevHRaw, cmp2_5PrevLRaw] = request.security(comparisonTicker2, tf5, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+[cmp2_1PrevHRaw, cmp2_1PrevLRaw] = request.security(comparisonTicker2, tf1, [high[1], low[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+
+float cmp1DPrevH = useComparison1 ? cmp1DPrevHRaw : na
+float cmp1DPrevL = useComparison1 ? cmp1DPrevLRaw : na
+float cmp1WPrevH = useComparison1 ? cmp1WPrevHRaw : na
+float cmp1WPrevL = useComparison1 ? cmp1WPrevLRaw : na
+float cmp2DPrevH = useComparison2 ? cmp2DPrevHRaw : na
+float cmp2DPrevL = useComparison2 ? cmp2DPrevLRaw : na
+float cmp2WPrevH = useComparison2 ? cmp2WPrevHRaw : na
+float cmp2WPrevL = useComparison2 ? cmp2WPrevLRaw : na
+
+float cmp1_4HPrevH = useComparison1 ? cmp1_4HPrevHRaw : na
+float cmp1_4HPrevL = useComparison1 ? cmp1_4HPrevLRaw : na
+float cmp1_1HPrevH = useComparison1 ? cmp1_1HPrevHRaw : na
+float cmp1_1HPrevL = useComparison1 ? cmp1_1HPrevLRaw : na
+float cmp1_30PrevH = useComparison1 ? cmp1_30PrevHRaw : na
+float cmp1_30PrevL = useComparison1 ? cmp1_30PrevLRaw : na
+float cmp1_15PrevH = useComparison1 ? cmp1_15PrevHRaw : na
+float cmp1_15PrevL = useComparison1 ? cmp1_15PrevLRaw : na
+float cmp1_5PrevH = useComparison1 ? cmp1_5PrevHRaw : na
+float cmp1_5PrevL = useComparison1 ? cmp1_5PrevLRaw : na
+float cmp1_1PrevH = useComparison1 ? cmp1_1PrevHRaw : na
+float cmp1_1PrevL = useComparison1 ? cmp1_1PrevLRaw : na
+
+float cmp2_4HPrevH = useComparison2 ? cmp2_4HPrevHRaw : na
+float cmp2_4HPrevL = useComparison2 ? cmp2_4HPrevLRaw : na
+float cmp2_1HPrevH = useComparison2 ? cmp2_1HPrevHRaw : na
+float cmp2_1HPrevL = useComparison2 ? cmp2_1HPrevLRaw : na
+float cmp2_30PrevH = useComparison2 ? cmp2_30PrevHRaw : na
+float cmp2_30PrevL = useComparison2 ? cmp2_30PrevLRaw : na
+float cmp2_15PrevH = useComparison2 ? cmp2_15PrevHRaw : na
+float cmp2_15PrevL = useComparison2 ? cmp2_15PrevLRaw : na
+float cmp2_5PrevH = useComparison2 ? cmp2_5PrevHRaw : na
+float cmp2_5PrevL = useComparison2 ? cmp2_5PrevLRaw : na
+float cmp2_1PrevH = useComparison2 ? cmp2_1PrevHRaw : na
+float cmp2_1PrevL = useComparison2 ? cmp2_1PrevLRaw : na
+
+chartShort = f_shortSymbol(syminfo.ticker)
+
+comp1Short = f_shortSymbol(comparisonSymbol1)
+
+comp2Short = f_shortSymbol(comparisonSymbol2)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// CORE MTF PROCESSOR
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_processTF(bool enabled, string tf, int slotLookback, float cmp1H, float cmp1L, float cmp2H, float cmp2L, float nativePrevH, float nativePrevL, float nativePrevCmp1H, float nativePrevCmp1L, float nativePrevCmp2H, float nativePrevCmp2L) =>
+
+    bool bearPrinted = false
+
+    bool bullPrinted = false
+
+    int tfSec = timeframe.in_seconds(tf)
+
+    int chartSec = timeframe.in_seconds(timeframe.period)
+
+    bool run = enabled and tfSec >= chartSec
+
+    int activeLookback = usePerTfLookbacks ? slotLookback : lookbackCandles
+
+    var float curH = na
+
+    var float curL = na
+
+    var int   curHT = na
+
+    var int   curLT = na
+
+    var int   curHI = na
+
+    var int   curLI = na
+
+    var int   curStart = na
+
+    var float curCmp1H = na
+
+    var float curCmp1L = na
+
+    var float curCmp2H = na
+
+    var float curCmp2L = na
+
+    var bool  curCmp1Valid = false
+
+    var bool  curCmp2Valid = false
+
+    var float[] hHist = array.new_float(0)
+
+    var float[] lHist = array.new_float(0)
+
+    var int[]   hTimeHist = array.new_int(0)
+
+    var int[]   lTimeHist = array.new_int(0)
+
+    var int[]   hIdxHist = array.new_int(0)
+
+    var int[]   lIdxHist = array.new_int(0)
+
+    var int[]   startHist = array.new_int(0)
+
+    var float[] cmp1HHist = array.new_float(0)
+
+    var float[] cmp1LHist = array.new_float(0)
+
+    var float[] cmp2HHist = array.new_float(0)
+
+    var float[] cmp2LHist = array.new_float(0)
+
+    if run
+
+        int thisStart = time(tf)
+
+        if na(curStart)
+
+            curStart := thisStart
+
+            curH := high
+
+            curL := low
+
+            curHT := time
+
+            curLT := time
+
+            curHI := bar_index
+
+            curLI := bar_index
+
+            curCmp1H := cmp1H
+
+            curCmp1L := cmp1L
+
+            curCmp2H := cmp2H
+
+            curCmp2L := cmp2L
+
+            curCmp1Valid := not na(cmp1H) and not na(cmp1L)
+
+            curCmp2Valid := not na(cmp2H) and not na(cmp2L)
+
+        else
+
+            bool newTF = thisStart != curStart
+
+            if newTF
+
+                if not persistAfterClose
+
+                    f_deleteEventsByTFStart(tf, curStart)
+
+                array.unshift(hHist, curH)
+
+                array.unshift(lHist, curL)
+
+                array.unshift(hTimeHist, curHT)
+
+                array.unshift(lTimeHist, curLT)
+
+                array.unshift(hIdxHist, curHI)
+
+                array.unshift(lIdxHist, curLI)
+
+                array.unshift(startHist, curStart)
+
+                array.unshift(cmp1HHist, curCmp1Valid ? curCmp1H : na)
+
+                array.unshift(cmp1LHist, curCmp1Valid ? curCmp1L : na)
+
+                array.unshift(cmp2HHist, curCmp2Valid ? curCmp2H : na)
+
+                array.unshift(cmp2LHist, curCmp2Valid ? curCmp2L : na)
+
+                while array.size(hHist) > activeLookback + 10
+
+                    array.pop(hHist)
+
+                    array.pop(lHist)
+
+                    array.pop(hTimeHist)
+
+                    array.pop(lTimeHist)
+
+                    array.pop(hIdxHist)
+
+                    array.pop(lIdxHist)
+
+                    array.pop(startHist)
+
+                    array.pop(cmp1HHist)
+
+                    array.pop(cmp1LHist)
+
+                    array.pop(cmp2HHist)
+
+                    array.pop(cmp2LHist)
+
+                curStart := thisStart
+
+                curH := high
+
+                curL := low
+
+                curHT := time
+
+                curLT := time
+
+                curHI := bar_index
+
+                curLI := bar_index
+
+                curCmp1H := cmp1H
+
+                curCmp1L := cmp1L
+
+                curCmp2H := cmp2H
+
+                curCmp2L := cmp2L
+
+                curCmp1Valid := not na(cmp1H) and not na(cmp1L)
+
+                curCmp2Valid := not na(cmp2H) and not na(cmp2L)
+
+            else
+
+                if high > curH or na(curH)
+
+                    curH := high
+
+                    curHT := time
+
+                    curHI := bar_index
+
+                if low < curL or na(curL)
+
+                    curL := low
+
+                    curLT := time
+
+                    curLI := bar_index
+
+                if not na(cmp1H)
+
+                    curCmp1H := na(curCmp1H) ? cmp1H : math.max(curCmp1H, cmp1H)
+
+                if not na(cmp1L)
+
+                    curCmp1L := na(curCmp1L) ? cmp1L : math.min(curCmp1L, cmp1L)
+
+                if not na(cmp2H)
+
+                    curCmp2H := na(curCmp2H) ? cmp2H : math.max(curCmp2H, cmp2H)
+
+                if not na(cmp2L)
+
+                    curCmp2L := na(curCmp2L) ? cmp2L : math.min(curCmp2L, cmp2L)
+
+                bool cmp1SampleValid = not na(cmp1H) and not na(cmp1L)
+
+                bool cmp2SampleValid = not na(cmp2H) and not na(cmp2L)
+
+                // Preserve the original strict behavior on 1H and below.
+
+                // For >1H scans, one missing/misaligned underlying chart bar no
+
+                // longer invalidates the entire 4H/D/W comparison candle. As long
+
+                // as valid comparison samples exist inside that HTF candle, the
+
+                // accumulated comparison high/low can still be used.
+
+                bool tolerantComparisonSampling = smtFilteringMode != "Clean" or tfSec > 60 * 60
+
+                if tolerantComparisonSampling
+
+                    // One missing/misaligned chart-TF sample should not invalidate
+                    // an entire SMT candle. Keep any valid aligned samples we do have.
+                    curCmp1Valid := curCmp1Valid or cmp1SampleValid
+
+                    curCmp2Valid := curCmp2Valid or cmp2SampleValid
+
+                else
+
+                    // Legacy strict behavior retained in Clean mode on 1H and below.
+                    curCmp1Valid := curCmp1Valid and cmp1SampleValid
+
+                    curCmp2Valid := curCmp2Valid and cmp2SampleValid
+
+        float minSweep = 0.0
+
+        float dedupe = dedupeTicks * syminfo.mintick
+
+        float endpointTol = math.max(syminfo.mintick, dedupe)
+
+        string tfSize = f_tfSizeString(tf)
+
+        float[] usedBearLevels = array.new_float(0)
+
+        float[] usedBullLevels = array.new_float(0)
+
+        int[] usedBearX = array.new_int(0)
+
+        float[] usedBearY = array.new_float(0)
+
+        int[] usedBullX = array.new_int(0)
+
+        float[] usedBullY = array.new_float(0)
+
+        int bearCount = 0
+
+        int bullCount = 0
+
+        int histSize = array.size(hHist)
+
+        int lb = math.min(activeLookback, histSize)
+
+        if lb > 0
+
+            for refIdx = 0 to lb - 1
+
+                float refH = array.get(hHist, refIdx)
+
+                float refL = array.get(lHist, refIdx)
+
+                int refHT = array.get(hTimeHist, refIdx)
+
+                int refLT = array.get(lTimeHist, refIdx)
+
+                int refHI = array.get(hIdxHist, refIdx)
+
+                int refLI = array.get(lIdxHist, refIdx)
+
+                int refStart = array.get(startHist, refIdx)
+
+                float refCmp1H = array.get(cmp1HHist, refIdx)
+
+                float refCmp1L = array.get(cmp1LHist, refIdx)
+
+                float refCmp2H = array.get(cmp2HHist, refIdx)
+
+                float refCmp2L = array.get(cmp2LHist, refIdx)
+
+                // Adjacent-period repair on every timeframe. Native comparison
+                // [1] values are confirmed and prevent a single missing underlying
+                // chart bar from corrupting the most important previous-TF reference.
+                bool useNativePrev = refIdx == 0
+
+                if useNativePrev
+
+                    if not na(nativePrevH) and not na(nativePrevL)
+                        refH := nativePrevH
+                        refL := nativePrevL
+
+                    if useComparison1 and not na(nativePrevCmp1H) and not na(nativePrevCmp1L)
+                        refCmp1H := nativePrevCmp1H
+                        refCmp1L := nativePrevCmp1L
+
+                    if useComparison2 and not na(nativePrevCmp2H) and not na(nativePrevCmp2L)
+                        refCmp2H := nativePrevCmp2H
+                        refCmp2L := nativePrevCmp2L
+
+                // Legacy untouched-reference rule. This is still used by Clean mode
+                // and remains one of the preferred reference types in Balanced mode.
+                bool untouchedHigh = true
+                bool untouchedLow = true
+
+                if refIdx > 0
+
+                    for checkIdx = 0 to refIdx - 1
+
+                        if array.get(hHist, checkIdx) >= refH
+                            untouchedHigh := false
+
+                        if array.get(lHist, checkIdx) <= refL
+                            untouchedLow := false
+
+                bool swingHigh = f_localSwingHigh(refIdx, refH, hHist, endpointTol)
+                bool swingLow = f_localSwingLow(refIdx, refL, lHist, endpointTol)
+
+                bool validHigh = smtFilteringMode == "Clean" ? untouchedHigh : smtFilteringMode == "Full" ? true : (untouchedHigh or swingHigh)
+                bool validLow = smtFilteringMode == "Clean" ? untouchedLow : smtFilteringMode == "Full" ? true : (untouchedLow or swingLow)
+
+
+
+                bool endpointBearUsed = smtFilteringMode == "Clean" and f_endpointAlreadyUsed(usedBearX, usedBearY, curHT, curH, endpointTol)
+
+                if showBearish and validHigh and bearCount < maxPerDirection and not endpointBearUsed and not f_levelAlreadyUsed(usedBearLevels, refH, dedupe)
+
+                    bool chartTookHigh = curH > refH + minSweep
+
+                    bool haveCmp1H = useComparison1 and curCmp1Valid and not na(curCmp1H) and not na(refCmp1H)
+
+                    bool haveCmp2H = useComparison2 and curCmp2Valid and not na(curCmp2H) and not na(refCmp2H)
+
+                    bool cmp1TookHigh = haveCmp1H and curCmp1H > refCmp1H + minSweep
+
+                    bool cmp2TookHigh = haveCmp2H and curCmp2H > refCmp2H + minSweep
+
+                    bool cmp1DivH = haveCmp1H and chartTookHigh != cmp1TookHigh
+
+                    bool cmp2DivH = haveCmp2H and chartTookHigh != cmp2TookHigh
+
+                    int requiredCompsH = (useComparison1 ? 1 : 0) + (useComparison2 ? 1 : 0)
+
+                    int validCompsH = (haveCmp1H ? 1 : 0) + (haveCmp2H ? 1 : 0)
+
+                    bool anyComparisonMode = useComparison1 or useComparison2
+
+                    bool eitherDivH = validCompsH > 0 and (cmp1DivH or cmp2DivH)
+
+                    bool allDivH = requiredCompsH > 0 and validCompsH == requiredCompsH and (not useComparison1 or cmp1DivH) and (not useComparison2 or cmp2DivH)
+
+                    bool isBear = anyComparisonMode ? (comparisonTriggerMode == "All enabled comparisons" ? allDivH : eitherDivH) : chartTookHigh
+
+                    bool closeOk = not requireCloseBack or close < refH
+
+                    if isBear and closeOk
+
+                        string suffix = anyComparisonMode ? f_compSuffix(cmp1DivH, cmp2DivH) : f_logoSymbol(syminfo.ticker)
+
+                        if str.length(suffix) == 0
+
+                            suffix := f_enabledCompSuffix()
+
+                        string txt = f_labelLogo(tf, suffix)
+
+                        string tip = anyComparisonMode ? "Bearish SMT vs " + suffix : chartShort + " swept its own HTF high."
+
+                        float y1 = refH
+
+                        float y2 = curH
+
+                        int x1Time = refHT
+
+                        int x2Time = curHT
+
+                        int x1Idx = refHI
+
+                        int x2Idx = curHI
+
+                        float anchor = chartTookHigh ? curH : refH
+
+
+
+                        string key = tf + "|BEAR|" + str.tostring(refStart) + "|" + str.tostring(curStart)
+
+                        bool drawn = f_drawOrUpdate(key, tf, tfSec, -1, refStart, curStart, x1Time, x1Idx, y1, x2Time, x2Idx, y2, anchor, txt, tip, endpointTol, tfSize)
+
+                        if drawn
+
+                            bearPrinted := true
+
+                            bearCount += 1
+
+                            array.push(usedBearLevels, refH)
+
+                            array.push(usedBearY, curH)
+
+                            array.push(usedBearX, curHT)
+
+                bool endpointBullUsed = smtFilteringMode == "Clean" and f_endpointAlreadyUsed(usedBullX, usedBullY, curLT, curL, endpointTol)
+
+                if showBullish and validLow and bullCount < maxPerDirection and not endpointBullUsed and not f_levelAlreadyUsed(usedBullLevels, refL, dedupe)
+
+                    bool chartTookLow = curL < refL - minSweep
+
+                    bool haveCmp1L = useComparison1 and curCmp1Valid and not na(curCmp1L) and not na(refCmp1L)
+
+                    bool haveCmp2L = useComparison2 and curCmp2Valid and not na(curCmp2L) and not na(refCmp2L)
+
+                    bool cmp1TookLow = haveCmp1L and curCmp1L < refCmp1L - minSweep
+
+                    bool cmp2TookLow = haveCmp2L and curCmp2L < refCmp2L - minSweep
+
+                    bool cmp1DivL = haveCmp1L and chartTookLow != cmp1TookLow
+
+                    bool cmp2DivL = haveCmp2L and chartTookLow != cmp2TookLow
+
+                    int requiredCompsL = (useComparison1 ? 1 : 0) + (useComparison2 ? 1 : 0)
+
+                    int validCompsL = (haveCmp1L ? 1 : 0) + (haveCmp2L ? 1 : 0)
+
+                    bool anyComparisonMode = useComparison1 or useComparison2
+
+                    bool eitherDivL = validCompsL > 0 and (cmp1DivL or cmp2DivL)
+
+                    bool allDivL = requiredCompsL > 0 and validCompsL == requiredCompsL and (not useComparison1 or cmp1DivL) and (not useComparison2 or cmp2DivL)
+
+                    bool isBull = anyComparisonMode ? (comparisonTriggerMode == "All enabled comparisons" ? allDivL : eitherDivL) : chartTookLow
+
+                    bool closeOk = not requireCloseBack or close > refL
+
+                    if isBull and closeOk
+
+                        string suffix = anyComparisonMode ? f_compSuffix(cmp1DivL, cmp2DivL) : f_logoSymbol(syminfo.ticker)
+
+                        if str.length(suffix) == 0
+
+                            suffix := f_enabledCompSuffix()
+
+                        string txt = f_labelLogo(tf, suffix)
+
+                        string tip = anyComparisonMode ? "Bullish SMT vs " + suffix : chartShort + " swept its own HTF low."
+
+                        float y1 = refL
+
+                        float y2 = curL
+
+                        int x1Time = refLT
+
+                        int x2Time = curLT
+
+                        int x1Idx = refLI
+
+                        int x2Idx = curLI
+
+                        float anchor = chartTookLow ? curL : refL
+
+
+
+                        string key = tf + "|BULL|" + str.tostring(refStart) + "|" + str.tostring(curStart)
+
+                        bool drawn = f_drawOrUpdate(key, tf, tfSec, 1, refStart, curStart, x1Time, x1Idx, y1, x2Time, x2Idx, y2, anchor, txt, tip, endpointTol, tfSize)
+
+                        if drawn
+
+                            bullPrinted := true
+
+                            bullCount += 1
+
+                            array.push(usedBullLevels, refL)
+
+                            array.push(usedBullY, curL)
+
+                            array.push(usedBullX, curLT)
+
+        f_deleteUnseenCurrentTF(tf, curStart)
+
+    else
+
+        // Prevent drawings from a disabled slot or a timeframe below the chart
+
+        // timeframe from remaining on the chart after settings/timeframe changes.
+
+        f_deleteAllEventsByTF(tf)
+
+    [bearPrinted, bullPrinted]
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// PROCESS HIGH TF → LOW TF
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[bW, uW] = f_processTF(tfW_on, tfW, lookbackW, cmp1HighChart, cmp1LowChart, cmp2HighChart, cmp2LowChart, chartWPrevH, chartWPrevL, cmp1WPrevH, cmp1WPrevL, cmp2WPrevH, cmp2WPrevL)
+
+[bD, uD] = f_processTF(tfD_on, tfD, lookbackD, cmp1HighChart, cmp1LowChart, cmp2HighChart, cmp2LowChart, chartDPrevH, chartDPrevL, cmp1DPrevH, cmp1DPrevL, cmp2DPrevH, cmp2DPrevL)
+
+[b4H, u4H] = f_processTF(tf4H_on, tf4H, lookback4H, cmp1HighChart, cmp1LowChart, cmp2HighChart, cmp2LowChart, na, na, cmp1_4HPrevH, cmp1_4HPrevL, cmp2_4HPrevH, cmp2_4HPrevL)
+
+[b1H, u1H] = f_processTF(tf1H_on, tf1H, lookback1H, cmp1HighChart, cmp1LowChart, cmp2HighChart, cmp2LowChart, na, na, cmp1_1HPrevH, cmp1_1HPrevL, cmp2_1HPrevH, cmp2_1HPrevL)
+
+[b30, u30] = f_processTF(tf30_on, tf30, lookback30, cmp1HighChart, cmp1LowChart, cmp2HighChart, cmp2LowChart, na, na, cmp1_30PrevH, cmp1_30PrevL, cmp2_30PrevH, cmp2_30PrevL)
+
+[b15, u15] = f_processTF(tf15_on, tf15, lookback15, cmp1HighChart, cmp1LowChart, cmp2HighChart, cmp2LowChart, na, na, cmp1_15PrevH, cmp1_15PrevL, cmp2_15PrevH, cmp2_15PrevL)
+
+[b5, u5] = f_processTF(tf5_on, tf5, lookback5, cmp1HighChart, cmp1LowChart, cmp2HighChart, cmp2LowChart, na, na, cmp1_5PrevH, cmp1_5PrevL, cmp2_5PrevH, cmp2_5PrevL)
+
+[b1, u1] = f_processTF(tf1_on, tf1, lookback1, cmp1HighChart, cmp1LowChart, cmp2HighChart, cmp2LowChart, na, na, cmp1_1PrevH, cmp1_1PrevL, cmp2_1PrevH, cmp2_1PrevL)
+
+f_purgeBroken()
+
+f_enforceLtfCaps()
+
+// Persistent per-timeframe caps. These run after the higher-TF suppression pass,
+
+// so the oldest remaining drawings are removed only after duplicate cleanup.
+
+f_enforceExactTFRetention(tfW)
+
+f_enforceExactTFRetention(tfD)
+
+f_enforceExactTFRetention(tf4H)
+
+f_enforceExactTFRetention(tf1H)
+
+f_enforceExactTFRetention(tf30)
+
+f_enforceExactTFRetention(tf15)
+
+f_enforceExactTFRetention(tf5)
+
+f_enforceExactTFRetention(tf1)
+
+anyBear = bW or bD or b4H or b1H or b30 or b15 or b5 or b1
+
+anyBull = uW or uD or u4H or u1H or u30 or u15 or u5 or u1
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// OPTIONAL STATUS TABLE
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var table statusTable = table.new(position.bottom_right, 1, 1, bgcolor=color.new(color.black, 85), frame_color=color.new(color.gray, 80), frame_width=1)
+
+if barstate.islast and showSkippedLowerTF
+
+    string disabled = ""
+
+    disabled += tfW_on  and not f_isAllowedTF(tfW)  ? "W "   : ""
+
+    disabled += tfD_on  and not f_isAllowedTF(tfD)  ? "D "   : ""
+
+    disabled += tf4H_on and not f_isAllowedTF(tf4H) ? "4H "  : ""
+
+    disabled += tf1H_on and not f_isAllowedTF(tf1H) ? "1H "  : ""
+
+    disabled += tf30_on and not f_isAllowedTF(tf30) ? "30m " : ""
+
+    disabled += tf15_on and not f_isAllowedTF(tf15) ? "15m " : ""
+
+    disabled += tf5_on  and not f_isAllowedTF(tf5)  ? "5m "  : ""
+
+    disabled += tf1_on  and not f_isAllowedTF(tf1)  ? "1m "  : ""
+
+    string comps = f_enabledCompSuffix()
+
+    string modeTxt = str.length(comps) > 0 ? "SMT: " + chartShort + " vs " + comps : "One-symbol Sweep Mode"
+
+    string tableTxt = modeTxt
+
+    if str.length(disabled) > 0
+
+        tableTxt += "\nLower TFs blocked: " + disabled
+
+    table.cell(statusTable, 0, 0, tableTxt, text_color=color.white, text_size=size.tiny)
+
+else if barstate.islast
+
+    table.cell(statusTable, 0, 0, "", text_color=color.white, text_size=size.tiny)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ALERTS
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+alertcondition(enableAlerts and anyBear, "Bearish MTF SMT / Sweep", "Bearish MTF SMT or high sweep printed.")
+
+alertcondition(enableAlerts and anyBull, "Bullish MTF SMT / Sweep", "Bullish MTF SMT or low sweep printed.")
